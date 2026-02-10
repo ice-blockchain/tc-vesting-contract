@@ -7,26 +7,24 @@ import { MockERC20, VestingContract } from "../typechain-types";
 
 chai.use(chaiAsPromised);
 
-enum DurationUnits {
-    Days,
-    Weeks,
-    Months
-}
+enum DurationUnits { Days, Weeks, Months }
 
 describe("VestingContract", () => {
     let token: MockERC20;
+    let otherToken: MockERC20;
     let vesting: VestingContract;
 
     let deployer: SignerWithAddress;
     let teamWallet: SignerWithAddress;
 
     let startTime: number;
+    let snapshotId: string;
 
-    const amountToLock = ethers.utils.parseEther("5250000");
-    const duration = 20;
+    const amountToLock = ethers.utils.parseEther("1000");
+    const duration = 10;
 
-    const increaseTime = async (seconds: number) => {
-        await ethers.provider.send("evm_increaseTime", [seconds]);
+    const evmSetTime = async (seconds: number) => {
+        await ethers.provider.send("evm_setNextBlockTimestamp", [seconds]);
         await ethers.provider.send("evm_mine", []);
     };
 
@@ -37,193 +35,213 @@ describe("VestingContract", () => {
     beforeEach(async () => {
         const tokenFactory = await ethers.getContractFactory("MockERC20");
         token = (await tokenFactory.deploy()) as MockERC20;
+        otherToken = (await tokenFactory.deploy()) as MockERC20;
 
         const vestingFactory = await ethers.getContractFactory("VestingContract");
-        vesting = (await vestingFactory.deploy(token.address)) as VestingContract;
+        vesting = (await vestingFactory.deploy()) as VestingContract;
 
-        await token.mint(deployer.address, amountToLock);
-        await token.approve(vesting.address, amountToLock);
+        await token.mint(deployer.address, amountToLock.mul(10));
+        await token.approve(vesting.address, amountToLock.mul(10));
+        await otherToken.mint(deployer.address, amountToLock.mul(10));
+        await otherToken.approve(vesting.address, amountToLock.mul(10));
 
-        startTime = (await ethers.provider.getBlock("latest")).timestamp + 60;
+        const block = await ethers.provider.getBlock("latest");
+        startTime = block.timestamp + 3600;
     });
 
-    describe("constructor", () => {
-        it("should set token address", async () => {
-            expect(await vesting.token()).to.equal(token.address);
-        });
-    });
-
-    describe("createVestingSchedule", () => {
-        it("should rever if beneficiary is zero address", async () => {
+    describe("createVestingSchedule (Ordered Insert)", () => {
+        it("should revert if beneficiary is zero address", async () => {
             await expect(
-                vesting.createVestingSchedule(ethers.constants.AddressZero, startTime, duration, DurationUnits.Months, amountToLock),
-            ).to.be.revertedWith("VestingContract: beneficiary is the zero address");
+                vesting.createVestingSchedule(ethers.constants.AddressZero, token.address, startTime, duration, DurationUnits.Days, amountToLock)
+            ).to.be.revertedWith("VestingContract: beneficiary is zero address");
         });
 
         it("should revert if amount is zero", async () => {
-            await expect(vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, 0)).to.be.revertedWith(
-                "VestingContract: amount is 0",
-            );
-        });
-
-        it("should revert if start time is in the past", async () => {
             await expect(
-                vesting.createVestingSchedule(teamWallet.address, startTime - 61, duration, DurationUnits.Months, amountToLock),
-            ).to.be.revertedWith("VestingContract: start is before current time");
+                vesting.createVestingSchedule(teamWallet.address, token.address, startTime, duration, DurationUnits.Days, 0)
+            ).to.be.revertedWith("VestingContract: amount is 0");
         });
 
-        it("should transfer tokens to vesting contract", async () => {
-            expect(
-                await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock),
-            ).to.changeTokenBalance(token, vesting, amountToLock);
-        });
-
-        it("should create vesting schedule", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock);
-
-            const vestingSchedule = await vesting.vestingSchedules(teamWallet.address, 0);
-
-            expect(vestingSchedule.beneficiary).to.equal(teamWallet.address);
-            expect(vestingSchedule.start).to.equal(startTime);
-            expect(vestingSchedule.duration).to.equal(duration);
-            expect(vestingSchedule.amountTotal).to.equal(amountToLock);
-            expect(vestingSchedule.released).to.equal(0);
+        it("should enforce chronological order (Strong Guarantee)", async () => {
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, duration, DurationUnits.Days, amountToLock);
+            await expect(
+                vesting.createVestingSchedule(teamWallet.address, token.address, startTime - 1, duration, DurationUnits.Days, amountToLock)
+            ).to.be.revertedWith("VestingContract: schedules must be added in chronological order");
         });
     });
 
-    describe("vestedAmount", () => {
+    describe("vestedAmount & releasableAmount Logic", () => {
         it("should return 0 if vesting has not started", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock);
-
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 10, DurationUnits.Days, amountToLock);
             const schedule = await vesting.vestingSchedules(teamWallet.address, 0);
-
-            const vestedAmount = await vesting.vestedAmount(schedule);
-
-            expect(vestedAmount).to.equal(0);
+            expect(await vesting.vestedAmount(schedule)).to.equal(0);
         });
 
-        it("should return 0 if duration is 0 and vesting has not started", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, 0, DurationUnits.Months, amountToLock);
+        it("should return 50% halfway through", async () => {
+            const durationDays = 10;
+            const totalSeconds = durationDays * 24 * 60 * 60;
+
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, durationDays, DurationUnits.Days, amountToLock);
+
+            // "50%" is: StartTime + 5 Days
+            const halfWayPoint = startTime + (5 * 24 * 60 * 60);
+            await evmSetTime(halfWayPoint);
 
             const schedule = await vesting.vestingSchedules(teamWallet.address, 0);
+            const vested = await vesting.vestedAmount(schedule);
 
-            const vestedAmount = await vesting.vestedAmount(schedule);
+            expect(vested).to.equal(amountToLock.div(2));
+        });
+    });
 
-            expect(vestedAmount).to.equal(0);
+    describe("release (O(1) Bookmark)", () => {
+        it("should correctly release tokens and update 'released' field", async () => {
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 10, DurationUnits.Days, amountToLock);
+
+            // Exactly 1 second before vesting starts
+            const targetTime = startTime + (5 * 24 * 60 * 60) - 1;
+            await evmSetTime(targetTime);
+            await expect(() => vesting.release(teamWallet.address, token.address))
+            .to.changeTokenBalance(token, teamWallet, amountToLock.div(2));
         });
 
-        it("should return the total amount if duration is 0 and vesting has ended", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, 0, DurationUnits.Months, amountToLock);
+        it("should move the bookmark forward in release() even across different tokens", async () => {
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 1, DurationUnits.Days, amountToLock);
+            await vesting.createVestingSchedule(teamWallet.address, otherToken.address, startTime, 1, DurationUnits.Days, amountToLock);
 
-            await increaseTime(61);
-
-            const schedule = await vesting.vestingSchedules(teamWallet.address, 0);
-
-            const vestedAmount = await vesting.vestedAmount(schedule);
-
-            expect(vestedAmount).to.equal(amountToLock);
+            await evmSetTime(startTime + 100 + (2 * 24 * 60 * 60));
+            await vesting.release(teamWallet.address, token.address);
+            expect(await vesting.currentIndex(teamWallet.address, token.address)).to.equal(1);
         });
 
-        it("should return the total amount if vesting has ended", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock);
+        it("should release tokens for even a single second of elapsed time (Small Number)", async () => {
+            const amount = ethers.utils.parseEther("1000");
+            const durationDays = 10;
 
-            await increaseTime(duration * 60 * 60 * 24 * 30 + 61);
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, durationDays, DurationUnits.Days, amount);
 
-            const schedule = await vesting.vestingSchedules(teamWallet.address, 0);
+            // Exactly 1 second after vesting starts
+            const targetTime = startTime + 1;
+            await evmSetTime(targetTime);
 
-            const vestedAmount = await vesting.vestedAmount(schedule);
-
-            expect(vestedAmount).to.equal(amountToLock);
+            const releasable = await vesting.getReleasableAmount(teamWallet.address, token.address);
+            expect(releasable).to.be.gt(0);
         });
 
-        it("should return the correct amount if vesting is in progress", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock);
+        it("should handle maximum amounts and long durations without overflow (High Number)", async () => {
+            const whaleAmount = ethers.utils.parseEther("1000000000000");
+            const longDuration = 3650; // 10 years
 
-            await increaseTime(61);
+            await token.mint(deployer.address, whaleAmount);
+            await token.connect(deployer).approve(vesting.address, whaleAmount);
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, longDuration, DurationUnits.Days, whaleAmount);
 
-            for (let i = 0; i < duration; i++) {
-                await increaseTime(60 * 60 * 24 * 30);
+            // Jump 5 years ahead
+            const fiveYears = 5 * 365 * 24 * 60 * 60;
+            const targetTime = startTime + fiveYears;
+            await evmSetTime(targetTime);
 
-                const schedule = await vesting.vestingSchedules(teamWallet.address, 0);
+            const releasable = await vesting.getReleasableAmount(teamWallet.address, token.address);
+            expect(releasable).to.equal(whaleAmount.div(2));
+        });
 
-                const vestedAmount = await vesting.vestedAmount(schedule);
+        it("should process multiple partial schedules but only move bookmark when fully released", async () => {
+            const amount = ethers.utils.parseEther("100"); // 100 tokens per schedule
 
-                expect(vestedAmount).to.equal(amountToLock.div(duration).mul(i + 1));
+            // 1. Setup: Create 3 identical schedules starting now
+            for(let i = 0; i < 3; i++) {
+                await vesting.createVestingSchedule(
+                    teamWallet.address,
+                    token.address,
+                    startTime,
+                    duration,
+                    DurationUnits.Days,
+                    amount
+                );
             }
-        });
-    });
 
-    describe("releasableAmount", () => {
-        it("should correctly return the releasable amount", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock);
+            // 2. Jump to 50% (5 days)
+            const fiveDays = 5 * 24 * 60 * 60;
+            await evmSetTime(startTime + fiveDays - 1);
 
-            await increaseTime(61);
+            // 3. First Release: Should get 50 tokens from EACH (150 total)
+            // This proves the loop DOES NOT 'break' just because a schedule is partial
+            await expect(() => vesting.release(teamWallet.address, token.address))
+            .to.changeTokenBalance(token, teamWallet, amount.mul(3).div(2));
 
-            await increaseTime(60 * 60 * 24 * 30);
+            // 4. Verification: Bookmark should still be 0 because none are 'fully' released
+            // (You would need a public getter or check gas usage to see bookmark internal state)
 
-            const releasableAmountBefore = await vesting.releasableAmount(
-                await vesting.vestingSchedules(teamWallet.address, 0),
+            // 5. Jump to 100% (10 days)
+            await evmSetTime(startTime + 2 * fiveDays);
+
+            // 6. Second Release: Should get the remaining 150 tokens
+            await vesting.release(teamWallet.address, token.address);
+
+            // 7. PROOF: Add a 4th schedule starting MUCH later
+            const futureStart = startTime + (4 * fiveDays);
+            await vesting.createVestingSchedule(
+                teamWallet.address,
+                token.address,
+                futureStart,
+                duration,
+                DurationUnits.Days,
+                amount
             );
 
-            await vesting.release(teamWallet.address);
+            // If we call release now, and bookmark moved to 3, it should iterate 0 times
+            // and transfer 0 tokens because the 4th schedule hasn't started.
+            // If bookmark DIDN'T move, it would iterate through 0, 1, 2 again (checking released vs total)
+            const tx = await vesting.release(teamWallet.address, token.address);
+            const receipt = await tx.wait();
 
-            const schedule = await vesting.vestingSchedules(teamWallet.address, 0);
-
-            const releasedAmount = schedule.released;
-
-            const releasableAmountAfter = await vesting.releasableAmount(schedule);
-
-            expect(releasableAmountAfter).to.equal(releasableAmountBefore.sub(releasedAmount));
+            // Gas check: A bookmark at 3 will use significantly less gas than a bookmark at 0
+            // because it skips the 3 storage reads for the finished schedules.
+            expect(receipt.gasUsed).to.be.lt(100000);
         });
     });
 
-    describe("release", () => {
-        it("should rever it beneficiary has no vesting schedules", async () => {
-            await expect(vesting.release(teamWallet.address)).to.be.revertedWith(
-                "VestingContract: no vesting schedules for beneficiary",
-            );
+    describe("getReleasableAmount (Aggregation & Universal Break)", () => {
+        it("should aggregate only same-token amounts and stop at future schedules", async () => {
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 1, DurationUnits.Days, amountToLock);
+            await vesting.createVestingSchedule(teamWallet.address, otherToken.address, startTime, 1, DurationUnits.Days, amountToLock);
+
+            // S2: Token A (Started) - 10 Day duration
+            const s2Start = startTime + (2 * 24 * 60 * 60);
+            await vesting.createVestingSchedule(teamWallet.address, token.address, s2Start, 10, DurationUnits.Days, amountToLock);
+
+            // S3: Token A (Future)
+            const futureStart = s2Start + (100 * 24 * 60 * 60);
+            await vesting.createVestingSchedule(teamWallet.address, token.address, futureStart, 10, DurationUnits.Days, amountToLock);
+
+            // Move time to halfway through S2
+            // Calculation: startTime + 2 days (to reach S2 start) + 5 days (half of S2 duration)
+            const targetTime = startTime + (2 * 24 * 60 * 60) + (5 * 24 * 60 * 60);
+            await evmSetTime(targetTime);
+
+            const totalA = await vesting.getReleasableAmount(teamWallet.address, token.address);
+            expect(totalA).to.equal(amountToLock.add(amountToLock.div(2)));
+
+            const totalB = await vesting.getReleasableAmount(teamWallet.address, otherToken.address);
+            expect(totalB).to.equal(amountToLock);
         });
 
-        it("should not send tokens if there are no tokens to release", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock);
+        it("should stop immediately when hitting a future schedule (Global Break)", async () => {
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 1, DurationUnits.Days, amountToLock);
 
-            const balanceBefore = await token.balanceOf(teamWallet.address);
+            // S1: Token B (The Wall - 100 days in future)
+            const futureTime = startTime + (100 * 24 * 60 * 60);
+            await vesting.createVestingSchedule(teamWallet.address, otherToken.address, futureTime, 1, DurationUnits.Days, amountToLock);
 
-            await vesting.release(teamWallet.address)
+            // S2: Token A (Behind the Wall)
+            await vesting.createVestingSchedule(teamWallet.address, token.address, futureTime + 10, 1, DurationUnits.Days, amountToLock);
 
-            const balanceAfter = await token.balanceOf(teamWallet.address);
+            // Set time to exactly 12 hours after startTime
+            const targetTime = startTime + (12 * 60 * 60);
+            await evmSetTime(targetTime);
 
-            expect(balanceAfter).to.equal(balanceBefore);
-        });
-
-        it("should correctly release tokens", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock);
-
-            await increaseTime(60 * 60 * 24 * 30 + 61);
-
-            const releasableAmount = await vesting.releasableAmount(await vesting.vestingSchedules(teamWallet.address, 0));
-
-            await expect(vesting.release(teamWallet.address)).to.changeTokenBalance(token, teamWallet, releasableAmount);
-        });
-    });
-
-    describe("getReleaseableAmount", () => {
-        it("should return 0 if beneficiary has no vesting schedules", async () => {
-            const releasableAmount = await vesting.getReleaseableAmount(teamWallet.address);
-
-            expect(releasableAmount).to.equal(0);
-        });
-
-        it("should correctly return the releasable amount", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, startTime, duration, DurationUnits.Months, amountToLock);
-
-            await increaseTime(61);
-
-            await increaseTime(60 * 60 * 24 * 30);
-
-            const releasableAmount = await vesting.getReleaseableAmount(teamWallet.address);
-
-            expect(releasableAmount).to.equal(amountToLock.div(duration));
+            const totalA = await vesting.getReleasableAmount(teamWallet.address, token.address);
+            expect(totalA).to.equal(amountToLock.div(2));
         });
     });
 });

@@ -11,11 +11,6 @@ import * as dotenv from "dotenv";
 
 dotenv.config();
 
-const NETWORK_GAS_PRICE: Partial<Record<string, number>> = {
-  // "mainnet": ethers.utils.parseUnits("10", "gwei").toNumber(),
-  // "sepolia": ethers.utils.parseUnits("10", "gwei").toNumber(),
-};
-
 const config: HardhatUserConfig = {
   solidity: {
     compilers: [
@@ -24,7 +19,7 @@ const config: HardhatUserConfig = {
         settings: {
           optimizer: {
             enabled: true,
-            runs: 800,
+            runs: 10000,
             details: {
               yul: true,
             },
@@ -34,38 +29,11 @@ const config: HardhatUserConfig = {
     ],
   },
   networks: {
-    hardhat: {
-      initialBaseFeePerGas: 0,
-      chainId: 31337,
-      forking: {
-        url: process.env.ETH_MAINNET_URL || "",
-        // The Hardhat network will by default fork from the latest mainnet block
-        // To pin the block number, specify it below
-        // You will need access to a node with archival data for this to work!
-        // blockNumber: 14743877,
-        // If you want to do some forking, set `enabled` to true
-        enabled: false,
-      },
+    bsc_mainnet: {
+      url: process.env.BSC_MAINNET_RPC_URL || "",
+      chainId: 56,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
     },
-    localhost: {
-      url: "http://127.0.0.1:8545",
-    },
-    sepolia: {
-      chainId: 11155111,
-      url: process.env.ETH_SEPOLIA_URL || "",
-      accounts: process.env.PRIVATE_KEY !== undefined ? [process.env.PRIVATE_KEY] : [],
-      gasPrice: NETWORK_GAS_PRICE["sepolia"] || "auto",
-    },
-    main: {
-      chainId: 1,
-      url: process.env.ETH_MAINNET_URL || "",
-      accounts: process.env.PRIVATE_KEY !== undefined ? [process.env.PRIVATE_KEY] : [],
-      gasPrice: NETWORK_GAS_PRICE["mainnet"] || "auto",
-    },
-  },
-  gasReporter: {
-    enabled: process.env.REPORT_GAS !== undefined,
-    currency: "USD",
   },
   contractSizer: {
     alphaSort: true,
@@ -76,10 +44,17 @@ const config: HardhatUserConfig = {
     except: [],
   },
   etherscan: {
-    apiKey: {
-      mainnet: process.env.ETHERSCAN_API_KEY || "",
-      sepolia: process.env.ETHERSCAN_API_KEY || "",
-    },
+    apiKey: process.env.BSCSCAN_API_KEY || "",
+    customChains: [
+      {
+        network: "bsc_mainnet",
+        chainId: 56,
+        urls: {
+          apiURL: "https://api.bscscan.com/api",
+          browserURL: "https://bscscan.com"
+        }
+      },
+    ],
   },
 };
 
