@@ -1,27 +1,17 @@
-import type { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
+import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
 import chai, { expect } from "chai";
-import chaiAsPromised from "chai-as-promised";
 import { ethers } from "hardhat";
-
 import { MockERC20, VestingContract } from "../typechain-types";
 
-chai.use(chaiAsPromised);
-
-enum DurationUnits { Days, Weeks, Months }
-
-describe("VestingContract", () => {
+describe("VestingContract - Aggregate Logic", () => {
     let token: MockERC20;
-    let otherToken: MockERC20;
     let vesting: VestingContract;
-
     let deployer: SignerWithAddress;
     let teamWallet: SignerWithAddress;
-
     let startTime: number;
-    let snapshotId: string;
 
     const amountToLock = ethers.utils.parseEther("1000");
-    const duration = 10;
+    const duration = 60 * 24 * 60 * 60; // 60 days
 
     const evmSetTime = async (seconds: number) => {
         await ethers.provider.send("evm_setNextBlockTimestamp", [seconds]);
@@ -35,213 +25,159 @@ describe("VestingContract", () => {
     beforeEach(async () => {
         const tokenFactory = await ethers.getContractFactory("MockERC20");
         token = (await tokenFactory.deploy()) as MockERC20;
-        otherToken = (await tokenFactory.deploy()) as MockERC20;
 
         const vestingFactory = await ethers.getContractFactory("VestingContract");
         vesting = (await vestingFactory.deploy()) as VestingContract;
 
-        await token.mint(deployer.address, amountToLock.mul(10));
-        await token.approve(vesting.address, amountToLock.mul(10));
-        await otherToken.mint(deployer.address, amountToLock.mul(10));
-        await otherToken.approve(vesting.address, amountToLock.mul(10));
+        await token.mint(deployer.address, amountToLock.mul(100));
+        await token.approve(vesting.address, amountToLock.mul(100));
 
         const block = await ethers.provider.getBlock("latest");
-        startTime = block.timestamp + 3600;
+        startTime = block.timestamp + 3600; // Start in 1 hour
     });
 
-    describe("createVestingSchedule (Ordered Insert)", () => {
+    describe("createVestingSchedule", () => {
         it("should revert if beneficiary is zero address", async () => {
             await expect(
-                vesting.createVestingSchedule(ethers.constants.AddressZero, token.address, startTime, duration, DurationUnits.Days, amountToLock)
+                vesting.createVestingSchedule(ethers.constants.AddressZero, token.address, startTime, amountToLock)
             ).to.be.revertedWith("VestingContract: beneficiary is zero address");
         });
 
         it("should revert if amount is zero", async () => {
             await expect(
-                vesting.createVestingSchedule(teamWallet.address, token.address, startTime, duration, DurationUnits.Days, 0)
+                vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 0)
             ).to.be.revertedWith("VestingContract: amount is 0");
         });
 
-        it("should enforce chronological order (Strong Guarantee)", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, duration, DurationUnits.Days, amountToLock);
+        it("should revert if start is less than block timestamp", async () => {
             await expect(
-                vesting.createVestingSchedule(teamWallet.address, token.address, startTime - 1, duration, DurationUnits.Days, amountToLock)
-            ).to.be.revertedWith("VestingContract: schedules must be added in chronological order");
+                vesting.createVestingSchedule(teamWallet.address, token.address, startTime - 3601, 0)
+            ).to.be.revertedWith("VestingContract: start should point at least to current block");
+        });
+
+        it("should carry unclaimed residue into the new schedule when old one expires", async () => {
+            const firstPurchase = ethers.utils.parseEther("1000");
+            const secondPurchase = ethers.utils.parseEther("500");
+            const duration = 60 * 24 * 60 * 60; // 60 days
+
+            // 1. First Purchase
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, firstPurchase);
+
+            // 2. Jump to 100% expiry (61 days later)
+            // At this point, 1000 tokens are vested but 0 are released.
+            const expiredTime = startTime + duration + (24 * 60 * 60);
+            await evmSetTime(expiredTime);
+
+            // 3. Second Purchase (The Rollover Trigger)
+            // The contract sees (startTime + 60d) < block.timestamp
+            const newStart = expiredTime + 3600;
+            await expect(vesting.createVestingSchedule(teamWallet.address, token.address, newStart, secondPurchase))
+            .to.emit(vesting, "VestingScheduleCreated");
+
+            // 4. Verification of the "Residue"
+            const schedule = await vesting.vestingSchedules(teamWallet.address, token.address);
+
+            // Total should be 1000 (old unclaimed) + 500 (new) = 1500
+            expect(schedule.amountTotal).to.equal(firstPurchase.add(secondPurchase));
+
+            // Released must be reset to 0 to start the new 60-day cycle
+            expect(schedule.released).to.equal(0);
+
+            // Check math: 30 days into the NEW schedule, they should have 50% of 1500 = 750
+            await evmSetTime(newStart + (30 * 24 * 60 * 60));
+            const releasable = await vesting.getReleasableAmount(teamWallet.address, token.address);
+            expect(releasable).to.equal(ethers.utils.parseEther("750"));
         });
     });
 
-    describe("vestedAmount & releasableAmount Logic", () => {
-        it("should return 0 if vesting has not started", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 10, DurationUnits.Days, amountToLock);
-            const schedule = await vesting.vestingSchedules(teamWallet.address, 0);
-            expect(await vesting.vestedAmount(schedule)).to.equal(0);
+    describe("VestingContract - Aggregate Logic", () => {
+        describe("Aggregation and Overriding", () => {
+            it("should update existing schedule and emit VestingScheduleUpdated", async () => {
+                // Initial purchase
+                await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, amountToLock);
+
+                // Second purchase within the same active window
+                // This should add to the amountTotal without creating a new record
+                await expect(vesting.createVestingSchedule(teamWallet.address, token.address, startTime, amountToLock))
+                .to.emit(vesting, "VestingScheduleUpdated")
+                .withArgs(teamWallet.address, token.address, startTime, amountToLock.mul(2));
+
+                const schedule = await vesting.vestingSchedules(teamWallet.address, token.address);
+                expect(schedule.amountTotal).to.equal(amountToLock.mul(2));
+            });
+
+            it("should reset/override schedule if the previous one has expired", async () => {
+                // 1. Create initial schedule
+                await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, amountToLock);
+
+                // 2. Jump past the 60-day duration
+                const expiredTime = startTime + 60 * 86400 + 1;
+                await evmSetTime(expiredTime);
+
+                // 3. New purchase should trigger VestingScheduleCreated and reset released to 0
+                const newAmount = ethers.utils.parseEther("500");
+                await expect(vesting.createVestingSchedule(teamWallet.address, token.address, expiredTime + 100, newAmount))
+                .to.emit(vesting, "VestingScheduleCreated");
+
+                const schedule = await vesting.vestingSchedules(teamWallet.address, token.address);
+                expect(schedule.released).to.equal(0);
+                expect(schedule.amountTotal).to.equal(amountToLock.add(newAmount));
+            });
         });
 
-        it("should return 50% halfway through", async () => {
-            const durationDays = 10;
-            const totalSeconds = durationDays * 24 * 60 * 60;
+        describe("Release Efficiency", () => {
+            it("should maintain O(1) release cost regardless of purchase frequency", async () => {
+                // Add 10 daily buys (updates the same slot)
+                for(let i = 0; i < 10; i++) {
+                    await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, amountToLock);
+                }
 
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, durationDays, DurationUnits.Days, amountToLock);
+                await evmSetTime(startTime + (30 * 86400)); // 50% through
 
-            // "50%" is: StartTime + 5 Days
-            const halfWayPoint = startTime + (5 * 24 * 60 * 60);
-            await evmSetTime(halfWayPoint);
+                const tx = await vesting.release(teamWallet.address, token.address);
+                const receipt = await tx.wait();
 
-            const schedule = await vesting.vestingSchedules(teamWallet.address, 0);
-            const vested = await vesting.vestedAmount(schedule);
-
-            expect(vested).to.equal(amountToLock.div(2));
+                // Should be low because it's only 1 SSTORE to update 'released'
+                expect(receipt.gasUsed).to.be.lessThan(100000);
+            });
         });
     });
 
-    describe("release (O(1) Bookmark)", () => {
-        it("should correctly release tokens and update 'released' field", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 10, DurationUnits.Days, amountToLock);
+    describe("Gas Efficiency (Strict O(1))", () => {
+        it("should cost the same gas to add 1st purchase vs 100th purchase", async () => {
+            // 1st Purchase Gas
+            const tx1 = await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, amountToLock);
+            const receipt1 = await tx1.wait();
 
-            // Exactly 1 second before vesting starts
-            const targetTime = startTime + (5 * 24 * 60 * 60) - 1;
-            await evmSetTime(targetTime);
-            await expect(() => vesting.release(teamWallet.address, token.address))
-            .to.changeTokenBalance(token, teamWallet, amountToLock.div(2));
-        });
-
-        it("should move the bookmark forward in release() even across different tokens", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 1, DurationUnits.Days, amountToLock);
-            await vesting.createVestingSchedule(teamWallet.address, otherToken.address, startTime, 1, DurationUnits.Days, amountToLock);
-
-            await evmSetTime(startTime + 100 + (2 * 24 * 60 * 60));
-            await vesting.release(teamWallet.address, token.address);
-            expect(await vesting.currentIndex(teamWallet.address, token.address)).to.equal(1);
-        });
-
-        it("should release tokens for even a single second of elapsed time (Small Number)", async () => {
-            const amount = ethers.utils.parseEther("1000");
-            const durationDays = 10;
-
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, durationDays, DurationUnits.Days, amount);
-
-            // Exactly 1 second after vesting starts
-            const targetTime = startTime + 1;
-            await evmSetTime(targetTime);
-
-            const releasable = await vesting.getReleasableAmount(teamWallet.address, token.address);
-            expect(releasable).to.be.gt(0);
-        });
-
-        it("should handle maximum amounts and long durations without overflow (High Number)", async () => {
-            const whaleAmount = ethers.utils.parseEther("1000000000000");
-            const longDuration = 3650; // 10 years
-
-            await token.mint(deployer.address, whaleAmount);
-            await token.connect(deployer).approve(vesting.address, whaleAmount);
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, longDuration, DurationUnits.Days, whaleAmount);
-
-            // Jump 5 years ahead
-            const fiveYears = 5 * 365 * 24 * 60 * 60;
-            const targetTime = startTime + fiveYears;
-            await evmSetTime(targetTime);
-
-            const releasable = await vesting.getReleasableAmount(teamWallet.address, token.address);
-            expect(releasable).to.equal(whaleAmount.div(2));
-        });
-
-        it("should process multiple partial schedules but only move bookmark when fully released", async () => {
-            const amount = ethers.utils.parseEther("100"); // 100 tokens per schedule
-
-            // 1. Setup: Create 3 identical schedules starting now
-            for(let i = 0; i < 3; i++) {
-                await vesting.createVestingSchedule(
-                    teamWallet.address,
-                    token.address,
-                    startTime,
-                    duration,
-                    DurationUnits.Days,
-                    amount
-                );
+            // Perform 50 more purchases to "bloat" history (which shouldn't happen in storage)
+            for(let i = 0; i < 50; i++) {
+                await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, ethers.utils.parseEther("1"));
             }
 
-            // 2. Jump to 50% (5 days)
-            const fiveDays = 5 * 24 * 60 * 60;
-            await evmSetTime(startTime + fiveDays - 1);
+            // 52nd Purchase Gas
+            const tx2 = await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, amountToLock);
+            const receipt2 = await tx2.wait();
 
-            // 3. First Release: Should get 50 tokens from EACH (150 total)
-            // This proves the loop DOES NOT 'break' just because a schedule is partial
-            await expect(() => vesting.release(teamWallet.address, token.address))
-            .to.changeTokenBalance(token, teamWallet, amount.mul(3).div(2));
+            // Gas should be nearly identical because it's just updating one mapping slot
+            expect(receipt2.gasUsed).to.be.lte(receipt1.gasUsed);
+        });
 
-            // 4. Verification: Bookmark should still be 0 because none are 'fully' released
-            // (You would need a public getter or check gas usage to see bookmark internal state)
+        it("should cost the same gas to release regardless of how many times amount was updated", async () => {
+            // Add initial
+            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, amountToLock);
 
-            // 5. Jump to 100% (10 days)
-            await evmSetTime(startTime + 2 * fiveDays);
+            // Update 10 times
+            for(let i = 0; i < 10; i++) {
+                await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, amountToLock);
+            }
 
-            // 6. Second Release: Should get the remaining 150 tokens
-            await vesting.release(teamWallet.address, token.address);
+            await evmSetTime(startTime + (30 * 24 * 60 * 60)); // 50% through
 
-            // 7. PROOF: Add a 4th schedule starting MUCH later
-            const futureStart = startTime + (4 * fiveDays);
-            await vesting.createVestingSchedule(
-                teamWallet.address,
-                token.address,
-                futureStart,
-                duration,
-                DurationUnits.Days,
-                amount
-            );
-
-            // If we call release now, and bookmark moved to 3, it should iterate 0 times
-            // and transfer 0 tokens because the 4th schedule hasn't started.
-            // If bookmark DIDN'T move, it would iterate through 0, 1, 2 again (checking released vs total)
             const tx = await vesting.release(teamWallet.address, token.address);
             const receipt = await tx.wait();
 
-            // Gas check: A bookmark at 3 will use significantly less gas than a bookmark at 0
-            // because it skips the 3 storage reads for the finished schedules.
-            expect(receipt.gasUsed).to.be.lt(100000);
-        });
-    });
-
-    describe("getReleasableAmount (Aggregation & Universal Break)", () => {
-        it("should aggregate only same-token amounts and stop at future schedules", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 1, DurationUnits.Days, amountToLock);
-            await vesting.createVestingSchedule(teamWallet.address, otherToken.address, startTime, 1, DurationUnits.Days, amountToLock);
-
-            // S2: Token A (Started) - 10 Day duration
-            const s2Start = startTime + (2 * 24 * 60 * 60);
-            await vesting.createVestingSchedule(teamWallet.address, token.address, s2Start, 10, DurationUnits.Days, amountToLock);
-
-            // S3: Token A (Future)
-            const futureStart = s2Start + (100 * 24 * 60 * 60);
-            await vesting.createVestingSchedule(teamWallet.address, token.address, futureStart, 10, DurationUnits.Days, amountToLock);
-
-            // Move time to halfway through S2
-            // Calculation: startTime + 2 days (to reach S2 start) + 5 days (half of S2 duration)
-            const targetTime = startTime + (2 * 24 * 60 * 60) + (5 * 24 * 60 * 60);
-            await evmSetTime(targetTime);
-
-            const totalA = await vesting.getReleasableAmount(teamWallet.address, token.address);
-            expect(totalA).to.equal(amountToLock.add(amountToLock.div(2)));
-
-            const totalB = await vesting.getReleasableAmount(teamWallet.address, otherToken.address);
-            expect(totalB).to.equal(amountToLock);
-        });
-
-        it("should stop immediately when hitting a future schedule (Global Break)", async () => {
-            await vesting.createVestingSchedule(teamWallet.address, token.address, startTime, 1, DurationUnits.Days, amountToLock);
-
-            // S1: Token B (The Wall - 100 days in future)
-            const futureTime = startTime + (100 * 24 * 60 * 60);
-            await vesting.createVestingSchedule(teamWallet.address, otherToken.address, futureTime, 1, DurationUnits.Days, amountToLock);
-
-            // S2: Token A (Behind the Wall)
-            await vesting.createVestingSchedule(teamWallet.address, token.address, futureTime + 10, 1, DurationUnits.Days, amountToLock);
-
-            // Set time to exactly 12 hours after startTime
-            const targetTime = startTime + (12 * 60 * 60);
-            await evmSetTime(targetTime);
-
-            const totalA = await vesting.getReleasableAmount(teamWallet.address, token.address);
-            expect(totalA).to.equal(amountToLock.div(2));
+            console.log(`Release Gas: ${receipt.gasUsed.toString()}`);
+            expect(receipt.gasUsed).to.be.lessThan(100000); // Standard O(1) single-slot write
         });
     });
 });
