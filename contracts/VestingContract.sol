@@ -31,6 +31,7 @@ contract VestingContract {
      */
     mapping(address => mapping(address => VestingSchedule)) public vestingSchedules;
 
+    // TODO optimize the events to safe more gas
     event VestingScheduleCreated(address indexed beneficiary, address indexed token, uint256 start, uint256 amountTotal);
     event VestingScheduleUpdated(address indexed beneficiary, address indexed token, uint256 start, uint256 amountTotal);
 
@@ -57,7 +58,8 @@ contract VestingContract {
 
         if (schedule.start + VESTING_DURATION_IN_SECONDS < block.timestamp) {
             schedule.start = _start;
-            uint256 unclaimed = schedule.amountTotal - schedule.released;
+            uint256 unclaimed;
+            unchecked { unclaimed = schedule.amountTotal - schedule.released; }
             schedule.released = 0;
             schedule.amountTotal = _amountTotal + unclaimed;
             emit VestingScheduleCreated(_beneficiary, address(_token), _start, schedule.amountTotal);
@@ -72,11 +74,13 @@ contract VestingContract {
      * @notice Creates a batch of vesting schedule with a chronological guarantee.
      */
     function createVestingSchedules(VestingItem[] calldata _items) external {
-        for (uint256 i = 0; i < _items.length; i++) {
+        uint256 length = _items.length;
+        for (uint256 i = 0; i < length;) {
             createVestingSchedule(_items[i].beneficiary,
                                   _items[i].token,
                                   _items[i].start,
                                   _items[i].amountTotal);
+             unchecked { i++; }
         }
     }
 
@@ -88,9 +92,20 @@ contract VestingContract {
         VestingSchedule storage schedule = vestingSchedules[_beneficiary][_tokenAddress];
         uint256 amountToSend = releasableAmount(schedule);
         if (amountToSend > 0) {
-            schedule.released += amountToSend;
+            unchecked { schedule.released += amountToSend; }
             IERC20(_tokenAddress).safeTransfer(_beneficiary, amountToSend);
             emit TokensReleased(_beneficiary, _tokenAddress, amountToSend);
+        }
+    }
+
+    /**
+     * @notice Releases all available tokens for all give token type.
+     */
+    function releaseMany(address _beneficiary, address[] calldata _tokenAddresses) external {
+        uint256 length = _tokenAddresses.length;
+        for (uint256 i = 0; i < length;) {
+            release(_beneficiary, _tokenAddresses[i]);
+            unchecked { i++; }
         }
     }
 
@@ -107,7 +122,7 @@ contract VestingContract {
      * @param _schedule The vesting schedule
      */
     function releasableAmount(VestingSchedule memory _schedule) public view returns (uint256) {
-        return vestedAmount(_schedule) - _schedule.released;
+        unchecked { return vestedAmount(_schedule) - _schedule.released; }
     }
 
     /**
@@ -121,7 +136,8 @@ contract VestingContract {
         if (block.timestamp >= _schedule.start + VESTING_DURATION_IN_SECONDS) {
             return _schedule.amountTotal;
         }
-        uint256 secondsPassed = block.timestamp - _schedule.start;
-        return (_schedule.amountTotal * secondsPassed) / VESTING_DURATION_IN_SECONDS;
+        uint256 secondsPassed;
+        unchecked { secondsPassed = block.timestamp - _schedule.start; }
+        unchecked { return (_schedule.amountTotal * secondsPassed) / VESTING_DURATION_IN_SECONDS; }
     }
 }
