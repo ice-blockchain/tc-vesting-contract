@@ -52,7 +52,13 @@ describe("VestingContract - Aggregate Logic", () => {
         it("should revert if start is less than block timestamp", async () => {
             await expect(
                 vesting.createVestingSchedule(teamWallet.address, token.address, startTime - 3601, 0)
-            ).to.be.revertedWith("VestingContract: start should point at least to current block");
+            ).to.be.revertedWith("VestingContract: start should point to current block or offset");
+        });
+
+        it("should revert if start is over 60 days", async () => {
+            await expect(
+                vesting.createVestingSchedule(teamWallet.address, token.address, duration + 1, 0)
+            ).to.be.revertedWith("VestingContract: start should point to current block or offset");
         });
 
         it("should carry unclaimed residue into the new schedule when old one expires", async () => {
@@ -176,7 +182,6 @@ describe("VestingContract - Aggregate Logic", () => {
             const tx = await vesting.release(teamWallet.address, token.address);
             const receipt = await tx.wait();
 
-            console.log(`Release Gas: ${receipt.gasUsed.toString()}`);
             expect(receipt.gasUsed).to.be.lessThan(100000); // Standard O(1) single-slot write
         });
     });

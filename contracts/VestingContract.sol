@@ -48,10 +48,14 @@ contract VestingContract {
         uint256 _amountTotal
     ) public {
         require(_beneficiary != address(0), "VestingContract: beneficiary is zero address");
-        require(_start >= block.timestamp, "VestingContract: start should point at least to current block");
+        require(_start >= block.timestamp || _start <= VESTING_DURATION_IN_SECONDS, "VestingContract: start should point to current block or offset");
         require(_amountTotal > 0, "VestingContract: amount is 0");
 
         VestingSchedule storage schedule = vestingSchedules[_beneficiary][address(_token)];
+
+        if (_start <= VESTING_DURATION_IN_SECONDS) {
+            unchecked { _start += uint64(block.timestamp); }
+        }
 
         // Transfer tokens to contract
         _token.safeTransferFrom(msg.sender, address(this), _amountTotal);
