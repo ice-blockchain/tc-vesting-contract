@@ -32,7 +32,12 @@ const config: HardhatUserConfig = {
     bsc_mainnet: {
       url: process.env.BSC_MAINNET_RPC_URL || "",
       chainId: 56,
-      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+      accounts: process.env.MAINNET_PRIVATE_KEY ? [process.env.MAINNET_PRIVATE_KEY] : [],
+    },
+    bsc_testnet: {
+      url: process.env.BSC_TESTNET_RPC_URL || "",
+      chainId: 97,
+      accounts: process.env.TESTNET_PRIVATE_KEY ? [process.env.TESTNET_PRIVATE_KEY] : [],
     },
   },
   contractSizer: {
@@ -52,6 +57,14 @@ const config: HardhatUserConfig = {
         urls: {
           apiURL: "https://api.bscscan.com/api",
           browserURL: "https://bscscan.com"
+        }
+      },
+      {
+        network: "bsc_mainnet",
+        chainId: 97,
+        urls: {
+          apiURL: "https://api.bscscan.com/api",
+          browserURL: "https://testnet.bscscan.com"
         }
       },
     ],
